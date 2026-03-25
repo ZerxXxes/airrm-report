@@ -5,10 +5,11 @@ This module orchestrates the collection of AI-RRM performance metrics
 from DNA Center across multiple buildings and frequency bands. It provides
 data structures and collection logic for generating comprehensive reports.
 """
+
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from api_client import DNACenterClient
 
@@ -48,9 +49,7 @@ class BuildingMetrics:
     has_issues: bool = False
 
     def calculate_issue_status(
-        self,
-        health_threshold: float = 70.0,
-        changes_threshold: int = 100
+        self, health_threshold: float = 70.0, changes_threshold: int = 100
     ) -> None:
         """
         Determine if building has issues based on thresholds.
@@ -72,9 +71,9 @@ class BuildingMetrics:
             None: Sets self.has_issues flag
         """
         self.has_issues = (
-            self.rrm_health_score < health_threshold or
-            len(self.insights) > 0 or
-            self.rrm_changes > changes_threshold
+            self.rrm_health_score < health_threshold
+            or len(self.insights) > 0
+            or self.rrm_changes > changes_threshold
         )
 
 
@@ -87,21 +86,26 @@ class DataCollector:
     across all frequency bands.
     """
 
-    # Frequency band mapping (band number to display label)
-    FREQUENCY_BANDS = {
-        2: "2.4 GHz",
-        5: "5 GHz",
-        6: "6 GHz"
-    }
+    # Frequency band mapping (Catalyst Center API enum → display label).
+    #
+    # The Catalyst Center AI-RRM GraphQL API uses a sequential 1-based enum
+    # for the frequencyBand parameter, NOT the literal GHz values:
+    #   1 = 2.4 GHz
+    #   2 = 5 GHz
+    #   3 = 6 GHz
+    FREQUENCY_BANDS = {1: "2.4 GHz", 2: "5 GHz", 3: "6 GHz"}
 
-    def __init__(self, client: DNACenterClient, enabled_bands: List[int] = None) -> None:
+    def __init__(
+        self, client: DNACenterClient, enabled_bands: Optional[List[int]] = None
+    ) -> None:
         """
         Initialize data collector.
 
         Parameters:
             client (DNACenterClient): Authenticated DNA Center client
-            enabled_bands (List[int]): List of frequency bands to collect (2, 5, 6).
-                If None, collects all bands. Default: None
+            enabled_bands (List[int]): List of frequency band enum values to
+                collect (1=2.4 GHz, 2=5 GHz, 3=6 GHz). If None, collects all
+                bands. Default: None
 
         Returns:
             None
@@ -109,19 +113,17 @@ class DataCollector:
         self.client: DNACenterClient = client
         self.buildings: List[Dict[str, Any]] = []
         self.metrics: List[BuildingMetrics] = []
-        
+
         # Configure which bands to collect
         if enabled_bands is None:
             self.enabled_bands = list(self.FREQUENCY_BANDS.keys())
         else:
-            # Validate bands
+            # Discard any values not in the known enum set
             self.enabled_bands = [b for b in enabled_bands if b in self.FREQUENCY_BANDS]
             if not self.enabled_bands:
-                logger.warning(
-                    f"No valid frequency bands specified. Using all bands."
-                )
+                logger.warning("No valid frequency bands specified. Using all bands.")
                 self.enabled_bands = list(self.FREQUENCY_BANDS.keys())
-        
+
         logger.info(
             f"Data collector initialized for bands: "
             f"{', '.join([self.FREQUENCY_BANDS[b] for b in self.enabled_bands])}"
@@ -145,7 +147,7 @@ class DataCollector:
             None: Errors are logged but don't stop collection
         """
         logger.info("Starting data collection")
-        
+
         # Perform health check before collection
         logger.info("Validating connectivity to Catalyst Center...")
         if not self.client.health_check():
@@ -170,28 +172,33 @@ class DataCollector:
         # Collect metrics for each building and frequency band
         successful_collections = 0
         failed_collections = 0
-        
+
         for building in self.buildings:
-            building_id = building.get('instanceUUID')
-            building_name = building.get('name', 'Unknown')
-            building_hierarchy = building.get('groupNameHierarchy', '')
-            profile_name = building.get('aiRfProfileName', 'Unknown')
+            building_id: Optional[str] = building.get("instanceUUID")
+            building_name = building.get("name", "Unknown")
+            building_hierarchy = building.get("groupNameHierarchy", "")
+            profile_name = building.get("aiRfProfileName", "Unknown")
+
+            if not building_id:
+                logger.warning(
+                    f"Skipping building '{building_name}': missing instanceUUID"
+                )
+                continue
 
             logger.info(
-                f"Collecting data for building: "
-                f"{building_name} ({building_hierarchy})"
+                f"Collecting data for building: {building_name} ({building_hierarchy})"
             )
 
             # Iterate through enabled frequency bands only
             for freq_band, freq_label in self.FREQUENCY_BANDS.items():
                 # Skip bands not enabled in configuration
                 if freq_band not in self.enabled_bands:
-                    logger.debug(
+                    logger.warning(
                         f"Skipping {freq_label} for {building_name} "
                         f"(band not enabled in configuration)"
                     )
                     continue
-                    
+
                 try:
                     metrics = self._collect_building_frequency_metrics(
                         building_id,
@@ -199,34 +206,32 @@ class DataCollector:
                         building_hierarchy,
                         profile_name,
                         freq_band,
-                        freq_label
+                        freq_label,
                     )
                     if metrics:
                         self.metrics.append(metrics)
                         successful_collections += 1
                 except Exception as e:
-                    # Log but continue - don't let one failure stop all
+                    # Log but continue — one failure should not stop all collection
                     failed_collections += 1
                     logger.error(
                         f"Failed to collect metrics for "
                         f"{building_name} - {freq_label}: {e}"
                     )
-                    logger.debug(f"Error details:", exc_info=True)
+                    logger.debug("Error details:", exc_info=True)
 
         logger.info(
             f"Collection complete. Gathered metrics for "
             f"{len(self.metrics)} building/frequency combinations"
         )
-        logger.info(
-            f"Success: {successful_collections}, Failed: {failed_collections}"
-        )
-        
+        logger.info(f"Success: {successful_collections}, Failed: {failed_collections}")
+
         if failed_collections > 0:
             logger.warning(
                 f"{failed_collections} collection(s) failed - "
                 f"report will contain partial data"
             )
-        
+
         return self.metrics
 
     def _collect_building_frequency_metrics(
@@ -236,7 +241,7 @@ class DataCollector:
         building_hierarchy: str,
         profile_name: str,
         freq_band: int,
-        freq_label: str
+        freq_label: str,
     ) -> BuildingMetrics:
         """
         Collect all metrics for a single building/frequency combo.
@@ -251,15 +256,15 @@ class DataCollector:
             building_name (str): Building display name
             building_hierarchy (str): Full site hierarchy path
             profile_name (str): AI-RRM profile name
-            freq_band (int): Frequency band number (2, 5, or 6)
-            freq_label (str): Display label (e.g., "2.4 GHz")
+            freq_band (int): Frequency band enum value (1=2.4 GHz, 2=5 GHz,
+                3=6 GHz)
+            freq_label (str): Display label (e.g., "5 GHz")
 
         Returns:
             BuildingMetrics: Populated metrics object
 
         Raises:
-            None: Individual API failures are logged but don't fail
-                the method
+            None: Individual API failures are logged but don't fail the method
         """
         logger.debug(f"  Fetching {freq_label} data...")
 
@@ -270,51 +275,36 @@ class DataCollector:
             building_hierarchy=building_hierarchy,
             profile_name=profile_name,
             frequency_band=freq_band,
-            frequency_label=freq_label
+            frequency_label=freq_label,
         )
 
         # Get coverage data (AP count, client count)
         try:
-            coverage = self.client.get_coverage_summary(
-                building_id,
-                freq_band
-            )
+            coverage = self.client.get_coverage_summary(building_id, freq_band)
             if coverage:
-                metrics.ap_count = coverage.get('totalApCount', 0)
-                metrics.client_count = coverage.get('totalClients', 0)
-                metrics.timestamp = coverage.get('timestamp', '')
+                metrics.ap_count = coverage.get("totalApCount", 0)
+                metrics.client_count = coverage.get("totalClients", 0)
+                metrics.timestamp = coverage.get("timestamp", "")
         except Exception as e:
-            # Edge case: API call fails, log and continue with defaults
             logger.warning(f"    Could not fetch coverage data: {e}")
 
         # Get performance data (RRM health score, changes)
         try:
-            performance = self.client.get_performance_summary(
-                building_id,
-                freq_band
-            )
+            performance = self.client.get_performance_summary(building_id, freq_band)
             if performance:
-                metrics.rrm_health_score = performance.get(
-                    'rrmHealthScore',
-                    0.0
-                )
-                metrics.rrm_changes = performance.get(
-                    'totalRrmChangesV2',
-                    0
-                )
+                metrics.rrm_health_score = performance.get("rrmHealthScore", 0.0)
+                metrics.rrm_changes = performance.get("totalRrmChangesV2", 0)
                 # Use performance timestamp if coverage didn't provide one
                 if not metrics.timestamp:
-                    metrics.timestamp = performance.get('timestamp', '')
+                    metrics.timestamp = performance.get("timestamp", "")
         except Exception as e:
-            # Edge case: API call fails, log and continue with defaults
             logger.warning(f"    Could not fetch performance data: {e}")
 
-        # Get insights
+        # Get AI-generated insights
         try:
             insights = self.client.get_insights(building_id, freq_band)
             metrics.insights = insights
         except Exception as e:
-            # Edge case: API call fails, insights remain empty list
             logger.warning(f"    Could not fetch insights: {e}")
 
         # Calculate issue status based on collected data
@@ -327,7 +317,7 @@ class DataCollector:
         Calculate summary statistics across all collected metrics.
 
         Aggregates data from all collected building/frequency metrics
-        to provide high-level statistics for executive summary.
+        to provide high-level statistics for the executive summary.
 
         Returns:
             Dict[str, Any]: Summary statistics including:
@@ -347,10 +337,8 @@ class DataCollector:
         if not self.metrics:
             return {}
 
-        # Calculate unique building count (handles multiple frequencies)
-        total_buildings = len(
-            set(m.building_id for m in self.metrics)
-        )
+        # Calculate unique building count (multiple frequencies per building)
+        total_buildings = len(set(m.building_id for m in self.metrics))
         buildings_with_issues = len(
             set(m.building_id for m in self.metrics if m.has_issues)
         )
@@ -360,18 +348,19 @@ class DataCollector:
         total_clients = sum(m.client_count for m in self.metrics)
         total_insights = sum(len(m.insights) for m in self.metrics)
 
-        # Calculate average health score
+        # Calculate average health score across all building/band combinations
         avg_health_score = (
-            sum(m.rrm_health_score for m in self.metrics) /
-            len(self.metrics) if self.metrics else 0
+            sum(m.rrm_health_score for m in self.metrics) / len(self.metrics)
+            if self.metrics
+            else 0
         )
 
         return {
-            'total_buildings': total_buildings,
-            'buildings_with_issues': buildings_with_issues,
-            'total_aps': total_aps,
-            'total_clients': total_clients,
-            'total_insights': total_insights,
-            'average_health_score': round(avg_health_score, 2),
-            'collection_timestamp': datetime.now().isoformat()
+            "total_buildings": total_buildings,
+            "buildings_with_issues": buildings_with_issues,
+            "total_aps": total_aps,
+            "total_clients": total_clients,
+            "total_insights": total_insights,
+            "average_health_score": round(avg_health_score, 2),
+            "collection_timestamp": datetime.now().isoformat(),
         }
