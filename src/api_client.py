@@ -5,6 +5,7 @@ This module provides a client interface for interacting with Cisco DNA
 Center APIs, specifically for AI-RRM (AI Radio Resource Management)
 data collection using both REST and GraphQL endpoints.
 """
+
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -42,26 +43,27 @@ class DNACenterClient:
         self.base_url: str = auth.base_url
         self.verify_ssl: bool = auth.verify_ssl
         self.max_retries: int = max_retries
-        
+
+        # Lazily populated by _get_site_map(); avoids an extra API call on
+        # init and allows health_check() to succeed before the map is needed.
+        self._site_map: Optional[Dict[str, Dict[str, Any]]] = None
+
         # Configure session with retry strategy
         self.session = requests.Session()
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=1,  # Wait 1, 2, 4 seconds between retries
             status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
-            allowed_methods=["GET", "POST"]  # Only retry safe methods
+            allowed_methods=["GET", "POST"],  # Only retry safe methods
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
+
         logger.debug(f"API client initialized with {max_retries} max retries")
 
     def _make_request(
-        self,
-        method: str,
-        endpoint: str,
-        **kwargs: Any
+        self, method: str, endpoint: str, **kwargs: Any
     ) -> requests.Response:
         """
         Make authenticated request to DNA Center API with retry logic.
@@ -85,8 +87,8 @@ class DNACenterClient:
         headers = self.auth.get_headers()
 
         # Merge additional headers if provided
-        if 'headers' in kwargs:
-            headers.update(kwargs.pop('headers'))
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
 
         try:
             response = self.session.request(
@@ -95,24 +97,26 @@ class DNACenterClient:
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=60,
-                **kwargs
+                **kwargs,
             )
             # Raise exception for 4xx/5xx status codes
             response.raise_for_status()
             logger.debug(f"API request successful: {method} {endpoint}")
             return response
-            
+
         except requests.exceptions.Timeout as e:
             logger.error(f"API request timeout: {method} {endpoint} - {e}")
             raise
-            
+
         except requests.exceptions.ConnectionError as e:
             logger.error(f"API connection error: {method} {endpoint} - {e}")
             logger.error(f"Check that Catalyst Center is reachable at {self.base_url}")
             raise
-            
+
         except requests.exceptions.HTTPError as e:
-            logger.error(f"API HTTP error: {method} {endpoint} - Status {e.response.status_code}")
+            logger.error(
+                f"API HTTP error: {method} {endpoint} - Status {e.response.status_code}"
+            )
             if e.response.status_code == 401:
                 logger.error("Authentication failed - check credentials")
             elif e.response.status_code == 403:
@@ -120,40 +124,40 @@ class DNACenterClient:
             elif e.response.status_code == 404:
                 logger.error(f"Endpoint not found: {endpoint}")
             raise
-            
+
         except requests.exceptions.RequestException as e:
             # Log error with full context for troubleshooting
-            logger.error(
-                f"API request failed: {method} {endpoint} - {e}"
-            )
+            logger.error(f"API request failed: {method} {endpoint} - {e}")
             raise
-    
+
     def health_check(self) -> bool:
         """
         Perform health check to verify connectivity to Catalyst Center.
-        
+
         Returns:
             bool: True if connection is healthy, False otherwise
         """
         try:
             logger.info(f"Performing health check: {self.base_url}")
-            
+
             # Try a simple API endpoint to verify connectivity
-            response = self._make_request('GET', '/api/v1/dna/sunray/airfprofilesitesinfo')
-            
+            response = self._make_request(
+                "GET", "/api/v1/dna/sunray/airfprofilesitesinfo"
+            )
+
             logger.info("✓ Health check passed - Catalyst Center is reachable")
             return True
-            
+
         except requests.exceptions.ConnectionError:
             logger.error(f"✗ Health check failed - Cannot reach {self.base_url}")
             logger.error("  Check network connectivity and Catalyst Center URL")
             return False
-            
+
         except requests.exceptions.Timeout:
             logger.error(f"✗ Health check failed - Request timeout to {self.base_url}")
             logger.error("  Catalyst Center may be overloaded or network is slow")
             return False
-            
+
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 logger.error("✗ Health check failed - Authentication error")
@@ -161,10 +165,87 @@ class DNACenterClient:
             else:
                 logger.error(f"✗ Health check failed - HTTP {e.response.status_code}")
             return False
-            
+
         except Exception as e:
             logger.error(f"✗ Health check failed - Unexpected error: {e}")
             return False
+
+    def _get_site_map(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Return cached site map, fetching from API on first call.
+
+        Parameters:
+            None
+
+        Returns:
+            Dict[str, Dict[str, Any]]: Mapping of site UUID to site metadata
+                with keys: name, type, parentId, hierarchy
+        """
+        if self._site_map is not None:
+            return self._site_map
+
+        logger.info("Building site map from /dna/intent/api/v1/site")
+        try:
+            response = self._make_request("GET", "/dna/intent/api/v1/site")
+            sites = response.json().get("response", [])
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch site map: {e}. Building UUID resolution disabled."
+            )
+            self._site_map = {}
+            return self._site_map
+
+        self._site_map = {}
+        for site in sites:
+            site_type: Optional[str] = None
+            for info in site.get("additionalInfo", []):
+                if info.get("nameSpace") == "Location":
+                    site_type = info.get("attributes", {}).get("type")
+            self._site_map[site["id"]] = {
+                "name": site.get("name", ""),
+                "type": site_type,
+                "parentId": site.get("parentId", ""),
+                "hierarchy": site.get("siteNameHierarchy", ""),
+            }
+
+        logger.info(f"Site map built: {len(self._site_map)} sites indexed")
+        return self._site_map
+
+    def resolve_building_uuid(self, site_uuid: str) -> str:
+        """
+        Return the building-level UUID for a given site UUID.
+
+        The AI-RRM profile API returns floor-level UUIDs in its
+        associatedBuildings array. GraphQL coverage and performance queries
+        require a building-level UUID. This method walks the parentId chain
+        to find the correct building UUID.
+
+        Parameters:
+            site_uuid (str): UUID from the AI-RRM profile site list
+
+        Returns:
+            str: Building-level UUID. Returns site_uuid unchanged if it is
+                already a building, is unknown, or the site map is unavailable.
+        """
+        site_map = self._get_site_map()
+        site = site_map.get(site_uuid, {})
+
+        site_type = site.get("type")
+        if not site or site_type in ("building", None):
+            return site_uuid
+
+        if site_type == "floor":
+            parent_id = site.get("parentId", "")
+            parent = site_map.get(parent_id, {})
+            if parent_id and parent.get("type") == "building":
+                logger.debug(f"Resolved floor {site_uuid} → building {parent_id}")
+                return parent_id
+
+        logger.debug(
+            f"Could not resolve building for site {site_uuid} (type={site_type}). "
+            f"Using original UUID."
+        )
+        return site_uuid
 
     def get_airrm_buildings(self) -> List[Dict[str, Any]]:
         """
@@ -191,25 +272,25 @@ class DNACenterClient:
         logger.info("Fetching AI-RRM enabled buildings")
         endpoint = "/api/v1/dna/sunray/airfprofilesitesinfo"
 
-        response = self._make_request('GET', endpoint)
+        response = self._make_request("GET", endpoint)
         data = response.json()
 
         # Use dict to deduplicate floor-level entries by building name
         building_map: Dict[str, Dict[str, Any]] = {}
         floor_count = 0
-        
+
         # Parse response and extract buildings from each profile
-        if 'response' in data:
-            for profile in data['response']:
-                profile_name = profile.get('aiRfProfileName', 'Unknown')
-                for site in profile.get('associatedBuildings', []):
+        if "response" in data:
+            for profile in data["response"]:
+                profile_name = profile.get("aiRfProfileName", "Unknown")
+                for site in profile.get("associatedBuildings", []):
                     floor_count += 1
-                    building_name = site.get('name', '')
-                    
+                    building_name = site.get("name", "")
+
                     # Group by building name - keep first occurrence
                     # AI-RRM operates at building level, not floor level
                     if building_name and building_name not in building_map:
-                        site['aiRfProfileName'] = profile_name
+                        site["aiRfProfileName"] = profile_name
                         building_map[building_name] = site
                         logger.debug(
                             f"Added building: {building_name} "
@@ -225,10 +306,7 @@ class DNACenterClient:
         return buildings
 
     def graphql_query(
-        self,
-        operation_name: str,
-        query: str,
-        variables: Dict[str, Any]
+        self, operation_name: str, query: str, variables: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         Execute GraphQL query against DNA Center.
@@ -245,24 +323,21 @@ class DNACenterClient:
             requests.exceptions.RequestException: If API call fails
         """
         endpoint = (
-            "/api/kairos/v1/proxy/api/v2/core-services/"
-            "customer-id/sunray/graphql"
+            "/api/kairos/v1/proxy/api/v2/core-services/customer-id/sunray/graphql"
         )
 
         payload = {
             "operationName": operation_name,
             "variables": variables,
-            "query": query
+            "query": query,
         }
 
         logger.debug(f"Executing GraphQL query: {operation_name}")
-        response = self._make_request('POST', endpoint, json=payload)
+        response = self._make_request("POST", endpoint, json=payload)
         return response.json()
 
     def get_coverage_summary(
-        self,
-        building_id: str,
-        frequency_band: int
+        self, building_id: str, frequency_band: int
     ) -> Optional[Dict[str, Any]]:
         """
         Get RF coverage summary for a building and frequency band.
@@ -308,27 +383,20 @@ class DNACenterClient:
             }
         }"""
 
-        variables = {
-            "buildingId": building_id,
-            "frequencyBand": frequency_band
-        }
+        variables = {"buildingId": building_id, "frequencyBand": frequency_band}
 
-        result = self.graphql_query(
-            "getRfCoverageSummaryLatest01",
-            query,
-            variables
-        )
+        result = self.graphql_query("getRfCoverageSummaryLatest01", query, variables)
 
         # Extract first node from result (edge case: empty response)
-        nodes = result.get('data', {}).get(
-            'getRfCoverageSummaryLatest01', {}
-        ).get('nodes', [])
+        nodes = (
+            result.get("data", {})
+            .get("getRfCoverageSummaryLatest01", {})
+            .get("nodes", [])
+        )
         return nodes[0] if nodes else None
 
     def get_performance_summary(
-        self,
-        building_id: str,
-        frequency_band: int
+        self, building_id: str, frequency_band: int
     ) -> Optional[Dict[str, Any]]:
         """
         Get RF performance summary for a building and frequency band.
@@ -372,27 +440,20 @@ class DNACenterClient:
             }
         }"""
 
-        variables = {
-            "buildingId": building_id,
-            "frequencyBand": frequency_band
-        }
+        variables = {"buildingId": building_id, "frequencyBand": frequency_band}
 
-        result = self.graphql_query(
-            "getRfPerformanceSummaryLatest01",
-            query,
-            variables
-        )
+        result = self.graphql_query("getRfPerformanceSummaryLatest01", query, variables)
 
         # Edge case: Handle missing or empty response
-        nodes = result.get('data', {}).get(
-            'getRfPerformanceSummaryLatest01', {}
-        ).get('nodes', [])
+        nodes = (
+            result.get("data", {})
+            .get("getRfPerformanceSummaryLatest01", {})
+            .get("nodes", [])
+        )
         return nodes[0] if nodes else None
 
     def get_insights(
-        self,
-        building_id: str,
-        frequency_band: int
+        self, building_id: str, frequency_band: int
     ) -> List[Dict[str, Any]]:
         """
         Get current AI-generated insights for a building/frequency.
@@ -438,19 +499,10 @@ class DNACenterClient:
             }
         }"""
 
-        variables = {
-            "buildingId": building_id,
-            "frequencyBand": frequency_band
-        }
+        variables = {"buildingId": building_id, "frequencyBand": frequency_band}
 
-        result = self.graphql_query(
-            "getCurrentInsights01",
-            query,
-            variables
-        )
+        result = self.graphql_query("getCurrentInsights01", query, variables)
 
         # Edge case: Return empty list instead of None for consistency
-        nodes = result.get('data', {}).get(
-            'getCurrentInsights01', {}
-        ).get('nodes', [])
+        nodes = result.get("data", {}).get("getCurrentInsights01", {}).get("nodes", [])
         return nodes if nodes else []

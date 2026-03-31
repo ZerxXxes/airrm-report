@@ -70,8 +70,9 @@ class BuildingMetrics:
         Returns:
             None: Sets self.has_issues flag
         """
+        has_data = self.ap_count > 0 or self.rrm_health_score > 0
         self.has_issues = (
-            self.rrm_health_score < health_threshold
+            (has_data and self.rrm_health_score < health_threshold)
             or len(self.insights) > 0
             or self.rrm_changes > changes_threshold
         )
@@ -185,6 +186,10 @@ class DataCollector:
                 )
                 continue
 
+            # The AI-RRM profile API returns floor-level UUIDs. Resolve to
+            # building level for coverage/performance GraphQL queries.
+            building_uuid = self.client.resolve_building_uuid(building_id)
+
             logger.info(
                 f"Collecting data for building: {building_name} ({building_hierarchy})"
             )
@@ -201,12 +206,13 @@ class DataCollector:
 
                 try:
                     metrics = self._collect_building_frequency_metrics(
-                        building_id,
-                        building_name,
-                        building_hierarchy,
-                        profile_name,
-                        freq_band,
-                        freq_label,
+                        floor_uuid=building_id,
+                        building_uuid=building_uuid,
+                        building_name=building_name,
+                        building_hierarchy=building_hierarchy,
+                        profile_name=profile_name,
+                        freq_band=freq_band,
+                        freq_label=freq_label,
                     )
                     if metrics:
                         self.metrics.append(metrics)
@@ -236,7 +242,8 @@ class DataCollector:
 
     def _collect_building_frequency_metrics(
         self,
-        building_id: str,
+        floor_uuid: str,
+        building_uuid: str,
         building_name: str,
         building_hierarchy: str,
         profile_name: str,
@@ -247,12 +254,14 @@ class DataCollector:
         Collect all metrics for a single building/frequency combo.
 
         Makes three separate API calls to gather:
-        1. Coverage data (APs, clients)
-        2. Performance data (health score, RRM changes)
-        3. Insights (AI-generated recommendations)
+        1. Coverage data (APs, clients) — uses building-level UUID
+        2. Performance data (health score, RRM changes) — uses building-level UUID
+        3. Insights (AI-generated recommendations) — uses floor-level UUID
 
         Parameters:
-            building_id (str): Building UUID
+            floor_uuid (str): Floor-level UUID from AI-RRM profile API
+            building_uuid (str): Building-level UUID resolved via site map;
+                equals floor_uuid when the site is already a building
             building_name (str): Building display name
             building_hierarchy (str): Full site hierarchy path
             profile_name (str): AI-RRM profile name
@@ -270,7 +279,7 @@ class DataCollector:
 
         # Initialize metrics object with building metadata
         metrics = BuildingMetrics(
-            building_id=building_id,
+            building_id=floor_uuid,
             building_name=building_name,
             building_hierarchy=building_hierarchy,
             profile_name=profile_name,
@@ -280,7 +289,7 @@ class DataCollector:
 
         # Get coverage data (AP count, client count)
         try:
-            coverage = self.client.get_coverage_summary(building_id, freq_band)
+            coverage = self.client.get_coverage_summary(building_uuid, freq_band)
             if coverage:
                 metrics.ap_count = coverage.get("totalApCount", 0)
                 metrics.client_count = coverage.get("totalClients", 0)
@@ -290,19 +299,18 @@ class DataCollector:
 
         # Get performance data (RRM health score, changes)
         try:
-            performance = self.client.get_performance_summary(building_id, freq_band)
+            performance = self.client.get_performance_summary(building_uuid, freq_band)
             if performance:
                 metrics.rrm_health_score = performance.get("rrmHealthScore", 0.0)
                 metrics.rrm_changes = performance.get("totalRrmChangesV2", 0)
-                # Use performance timestamp if coverage didn't provide one
                 if not metrics.timestamp:
                     metrics.timestamp = performance.get("timestamp", "")
         except Exception as e:
             logger.warning(f"    Could not fetch performance data: {e}")
 
-        # Get AI-generated insights
+        # Get AI-generated insights (floor-level UUID — insights are floor-scoped)
         try:
-            insights = self.client.get_insights(building_id, freq_band)
+            insights = self.client.get_insights(floor_uuid, freq_band)
             metrics.insights = insights
         except Exception as e:
             logger.warning(f"    Could not fetch insights: {e}")

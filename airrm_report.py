@@ -169,6 +169,7 @@ def load_config() -> Dict[str, Any]:
         enabled_bands = [1, 2, 3]
 
     config["enabled_bands"] = enabled_bands
+    config["configured_bands_str"] = bands_str  # Raw string for display in report
 
     # Validate required configuration
     missing = [
@@ -272,7 +273,9 @@ def main() -> None:
             logger.info("Generating report without logo (none specified)")
 
         generator = PDFReportGenerator(str(output_path), logo_path=logo_path)
-        generator.generate_report(metrics, summary_stats)
+        generator.generate_report(
+            metrics, summary_stats, configured_bands=config["configured_bands_str"]
+        )
 
         # Success! Report the results
         logger.info(f"✓ Report generated successfully: {output_path}")
