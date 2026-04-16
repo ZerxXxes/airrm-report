@@ -7,6 +7,7 @@ data structures and collection logic for generating comprehensive reports.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -130,14 +131,19 @@ class DataCollector:
             f"{', '.join([self.FREQUENCY_BANDS[b] for b in self.enabled_bands])}"
         )
 
+    # Maximum parallel API requests. Keeps load on Catalyst Center
+    # reasonable while still providing a significant speedup over
+    # sequential collection (e.g. 200 buildings × 3 bands).
+    _MAX_WORKERS: int = 8
+
     def collect_all_metrics(self) -> List[BuildingMetrics]:
         """
         Collect metrics for all AI-RRM enabled buildings.
 
         Orchestrates the entire collection process:
         1. Discovers buildings with AI-RRM enabled
-        2. Iterates through each building
-        3. Collects metrics for each frequency band (2.4, 5, 6 GHz)
+        2. Resolves floor→building UUIDs (requires site map)
+        3. Collects metrics for each building/band in parallel
         4. Handles errors gracefully, continuing on failure
 
         Returns:
@@ -170,10 +176,10 @@ class DataCollector:
             logger.warning("Check that AI-RRM profiles are assigned to buildings")
             return []
 
-        # Collect metrics for each building and frequency band
-        successful_collections = 0
-        failed_collections = 0
-
+        # Build list of (building_metadata, freq_band) tasks to execute.
+        # UUID resolution is done here (sequentially) because it shares
+        # a cached site map and is cheap after the first call.
+        tasks = []
         for building in self.buildings:
             building_id: Optional[str] = building.get("instanceUUID")
             building_name = building.get("name", "Unknown")
@@ -186,43 +192,52 @@ class DataCollector:
                 )
                 continue
 
-            # The AI-RRM profile API returns floor-level UUIDs. Resolve to
-            # building level for coverage/performance GraphQL queries.
             building_uuid = self.client.resolve_building_uuid(building_id)
 
-            logger.info(
-                f"Collecting data for building: {building_name} ({building_hierarchy})"
-            )
-
-            # Iterate through enabled frequency bands only
             for freq_band, freq_label in self.FREQUENCY_BANDS.items():
-                # Skip bands not enabled in configuration
                 if freq_band not in self.enabled_bands:
-                    logger.warning(
-                        f"Skipping {freq_label} for {building_name} "
-                        f"(band not enabled in configuration)"
-                    )
                     continue
+                tasks.append({
+                    "floor_uuid": building_id,
+                    "building_uuid": building_uuid,
+                    "building_name": building_name,
+                    "building_hierarchy": building_hierarchy,
+                    "profile_name": profile_name,
+                    "freq_band": freq_band,
+                    "freq_label": freq_label,
+                })
 
+        logger.info(
+            f"Collecting metrics for {len(tasks)} building/band combinations "
+            f"using up to {self._MAX_WORKERS} parallel workers"
+        )
+
+        # Collect metrics in parallel
+        successful_collections = 0
+        failed_collections = 0
+
+        with ThreadPoolExecutor(max_workers=self._MAX_WORKERS) as executor:
+            future_to_task = {
+                executor.submit(
+                    self._collect_building_frequency_metrics, **task
+                ): task
+                for task in tasks
+            }
+            for future in as_completed(future_to_task):
+                task_info = future_to_task[future]
+                label = (
+                    f"{task_info['building_name']} - "
+                    f"{task_info['freq_label']}"
+                )
                 try:
-                    metrics = self._collect_building_frequency_metrics(
-                        floor_uuid=building_id,
-                        building_uuid=building_uuid,
-                        building_name=building_name,
-                        building_hierarchy=building_hierarchy,
-                        profile_name=profile_name,
-                        freq_band=freq_band,
-                        freq_label=freq_label,
-                    )
+                    metrics = future.result()
                     if metrics:
                         self.metrics.append(metrics)
                         successful_collections += 1
                 except Exception as e:
-                    # Log but continue — one failure should not stop all collection
                     failed_collections += 1
                     logger.error(
-                        f"Failed to collect metrics for "
-                        f"{building_name} - {freq_label}: {e}"
+                        f"Failed to collect metrics for {label}: {e}"
                     )
                     logger.debug("Error details:", exc_info=True)
 

@@ -170,9 +170,16 @@ class DNACenterClient:
             logger.error(f"✗ Health check failed - Unexpected error: {e}")
             return False
 
+    # Maximum sites per page for /dna/intent/api/v1/site pagination.
+    _SITE_PAGE_LIMIT: int = 500
+
     def _get_site_map(self) -> Dict[str, Dict[str, Any]]:
         """
-        Return cached site map, fetching from API on first call.
+        Return cached site map, fetching all pages from API on first call.
+
+        The /dna/intent/api/v1/site endpoint silently caps results at
+        500 records per request. This method paginates with offset/limit
+        to ensure all sites are retrieved on large deployments.
 
         Parameters:
             None
@@ -185,28 +192,39 @@ class DNACenterClient:
             return self._site_map
 
         logger.info("Building site map from /dna/intent/api/v1/site")
-        try:
-            response = self._make_request("GET", "/dna/intent/api/v1/site")
-            sites = response.json().get("response", [])
-        except Exception as e:
-            logger.warning(
-                f"Could not fetch site map: {e}. Building UUID resolution disabled."
-            )
-            self._site_map = {}
-            return self._site_map
-
         self._site_map = {}
-        for site in sites:
-            site_type: Optional[str] = None
-            for info in site.get("additionalInfo", []):
-                if info.get("nameSpace") == "Location":
-                    site_type = info.get("attributes", {}).get("type")
-            self._site_map[site["id"]] = {
-                "name": site.get("name", ""),
-                "type": site_type,
-                "parentId": site.get("parentId", ""),
-                "hierarchy": site.get("siteNameHierarchy", ""),
-            }
+        offset = 1  # API uses 1-based indexing
+
+        while True:
+            try:
+                response = self._make_request(
+                    "GET",
+                    "/dna/intent/api/v1/site",
+                    params={"offset": offset, "limit": self._SITE_PAGE_LIMIT},
+                )
+                sites = response.json().get("response", [])
+            except Exception as e:
+                logger.warning(
+                    f"Could not fetch site map (offset={offset}): {e}. "
+                    "Building UUID resolution may be incomplete."
+                )
+                break
+
+            for site in sites:
+                site_type: Optional[str] = None
+                for info in site.get("additionalInfo", []):
+                    if info.get("nameSpace") == "Location":
+                        site_type = info.get("attributes", {}).get("type")
+                self._site_map[site["id"]] = {
+                    "name": site.get("name", ""),
+                    "type": site_type,
+                    "parentId": site.get("parentId", ""),
+                    "hierarchy": site.get("siteNameHierarchy", ""),
+                }
+
+            if len(sites) < self._SITE_PAGE_LIMIT:
+                break
+            offset += self._SITE_PAGE_LIMIT
 
         logger.info(f"Site map built: {len(self._site_map)} sites indexed")
         return self._site_map
