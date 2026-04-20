@@ -49,6 +49,10 @@ class BuildingMetrics:
     timestamp: str = ""
     has_issues: bool = False
 
+    # True when at least one of the three sub-API calls (coverage,
+    # performance, insights) failed; the returned metrics are partial.
+    partial_failure: bool = False
+
     def calculate_issue_status(
         self, health_threshold: float = 70.0, changes_threshold: int = 100
     ) -> None:
@@ -233,7 +237,14 @@ class DataCollector:
                     metrics = future.result()
                     if metrics:
                         self.metrics.append(metrics)
-                        successful_collections += 1
+                        if metrics.partial_failure:
+                            failed_collections += 1
+                            logger.warning(
+                                f"Partial data for {label}: "
+                                "one or more API calls failed"
+                            )
+                        else:
+                            successful_collections += 1
                 except Exception as e:
                     failed_collections += 1
                     logger.error(
@@ -252,12 +263,15 @@ class DataCollector:
             f"Collection complete. Gathered metrics for "
             f"{len(self.metrics)} building/frequency combinations"
         )
-        logger.info(f"Success: {successful_collections}, Failed: {failed_collections}")
+        logger.info(
+            f"Fully successful: {successful_collections}, "
+            f"Partial/failed: {failed_collections}"
+        )
 
         if failed_collections > 0:
             logger.warning(
-                f"{failed_collections} collection(s) failed - "
-                f"report will contain partial data"
+                f"{failed_collections} collection(s) had partial or complete "
+                f"API failures - report may contain incomplete data"
             )
 
         return self.metrics
@@ -318,6 +332,7 @@ class DataCollector:
                 metrics.timestamp = coverage.get("timestamp", "")
         except Exception as e:
             logger.warning(f"    Could not fetch coverage data: {e}")
+            metrics.partial_failure = True
 
         # Get performance data (RRM health score, changes)
         try:
@@ -329,6 +344,7 @@ class DataCollector:
                     metrics.timestamp = performance.get("timestamp", "")
         except Exception as e:
             logger.warning(f"    Could not fetch performance data: {e}")
+            metrics.partial_failure = True
 
         # Get AI-generated insights (floor-level UUID — insights are floor-scoped)
         try:
@@ -336,6 +352,7 @@ class DataCollector:
             metrics.insights = insights
         except Exception as e:
             logger.warning(f"    Could not fetch insights: {e}")
+            metrics.partial_failure = True
 
         # Calculate issue status based on collected data
         metrics.calculate_issue_status()

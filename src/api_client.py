@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3.util.retry import Retry
 
 from auth import DNACenterAuth
 
@@ -205,14 +205,23 @@ class DNACenterClient:
 
         Returns:
             Dict[str, Dict[str, Any]]: Mapping of site UUID to site metadata
-                with keys: name, type, parentId, hierarchy
+                with keys: name, type, parentId, hierarchy. Returns an
+                empty dict if pagination fails before the full map is
+                fetched; incomplete results are never cached.
         """
         if self._site_map is not None:
             return self._site_map
 
         logger.info("Building site map from /dna/intent/api/v1/site")
-        self._site_map = {}
+
+        # Build into a local dict first.  self._site_map is only written
+        # once all pages have been fetched successfully so that a
+        # mid-pagination failure leaves _site_map = None and the next
+        # caller retries rather than receiving a permanently-cached
+        # incomplete map.
+        site_map: Dict[str, Dict[str, Any]] = {}
         offset = 1  # API uses 1-based indexing
+        fetch_failed = False
 
         while True:
             try:
@@ -225,8 +234,10 @@ class DNACenterClient:
             except Exception as e:
                 logger.warning(
                     f"Could not fetch site map (offset={offset}): {e}. "
-                    "Building UUID resolution may be incomplete."
+                    "Building UUID resolution unavailable for this "
+                    "attempt; next call will retry."
                 )
+                fetch_failed = True
                 break
 
             for site in sites:
@@ -234,7 +245,7 @@ class DNACenterClient:
                 for info in site.get("additionalInfo", []):
                     if info.get("nameSpace") == "Location":
                         site_type = info.get("attributes", {}).get("type")
-                self._site_map[site["id"]] = {
+                site_map[site["id"]] = {
                     "name": site.get("name", ""),
                     "type": site_type,
                     "parentId": site.get("parentId", ""),
@@ -245,7 +256,14 @@ class DNACenterClient:
                 break
             offset += self._SITE_PAGE_LIMIT
 
-        logger.info(f"Site map built: {len(self._site_map)} sites indexed")
+        if fetch_failed:
+            # Leave self._site_map = None so the next call retries from
+            # scratch. Returning an empty map keeps UUID resolution
+            # behavior atomic for this attempt.
+            return {}
+
+        self._site_map = site_map
+        logger.info(f"Site map built: {len(site_map)} sites indexed")
         return self._site_map
 
     def resolve_building_uuid(self, site_uuid: str) -> str:
