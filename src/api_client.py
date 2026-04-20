@@ -7,6 +7,7 @@ data collection using both REST and GraphQL endpoints.
 """
 
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -48,19 +49,37 @@ class DNACenterClient:
         # init and allows health_check() to succeed before the map is needed.
         self._site_map: Optional[Dict[str, Dict[str, Any]]] = None
 
-        # Configure session with retry strategy
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1,  # Wait 1, 2, 4 seconds between retries
-            status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
-            allowed_methods=["GET", "POST"],  # Only retry safe methods
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        # Thread-local storage for requests.Session objects.
+        # requests.Session is not thread-safe, so each thread gets its own.
+        self._local = threading.local()
 
         logger.debug(f"API client initialized with {max_retries} max retries")
+
+    def _get_session(self) -> requests.Session:
+        """
+        Return a thread-local requests.Session with retry strategy.
+
+        Each thread gets its own Session instance to avoid
+        concurrency issues with shared cookie jars and connection
+        pool state.
+
+        Returns:
+            requests.Session: Configured session for the current thread
+        """
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            retry_strategy = Retry(
+                total=self.max_retries,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST"],
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._local.session = session
+        return session
 
     def _make_request(
         self, method: str, endpoint: str, **kwargs: Any
@@ -91,7 +110,7 @@ class DNACenterClient:
             headers.update(kwargs.pop("headers"))
 
         try:
-            response = self.session.request(
+            response = self._get_session().request(
                 method=method,
                 url=url,
                 headers=headers,

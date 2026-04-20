@@ -241,6 +241,13 @@ class DataCollector:
                     )
                     logger.debug("Error details:", exc_info=True)
 
+        # Restore deterministic ordering (as_completed returns in
+        # arbitrary finish order). Sort by building name then band
+        # so reports are consistent across runs.
+        self.metrics.sort(
+            key=lambda m: (m.building_name, m.frequency_band)
+        )
+
         logger.info(
             f"Collection complete. Gathered metrics for "
             f"{len(self.metrics)} building/frequency combinations"
